@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Demo for Landsat collection
+Parameters:
+  CodeBucket:
+    Type: String
+    Default: landsat-demo-code-bucket
+  UniqSuffix:
+    Type: String
+    Default: rixka
+    Description: Change this to add your uniquenes for S3 bucket names.
+
+Resources:
+  #### Storage ####
+  CreateLandsatImageBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-image-${UniqSuffix}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  #### Databases ####
+  CreateMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: ID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ID
+          KeyType: HASH
+      TableName: !Sub "${AWS::StackName}"
+      BillingMode: PAY_PER_REQUEST
+
+  #### Image Processing ####
+  ImageProcessing:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-image-processing"
+      Description: Update DDB table with image metadata.
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      MemorySize: 10240
+      Timeout: 120
+      Tracing: Active
+      Environment:
+        Variables:
+          DB_TABLE: !Ref CreateMetadataTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:*
+                - DynamoDB:*
+              Resource: "*"
+      Events:
+        CreateTemplateEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref CreateLandsatImageBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: '.TIF'
+      CodeUri:
+        Bucket: !Ref CodeBucket
+        Key: !Sub "${AWS::StackName}-image-processing.zip"
+      Layers:
+        - !Ref NumpyPillow
+
+  #### Prefix Organiser ####
+  PrefixOrganiser:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-organiser"
+      Description: Reads from CSV file and generates prefixes
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      MemorySize: 256
+      Timeout: 30
+      Tracing: Active
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      CodeUri:
+        Bucket: !Ref CodeBucket
+        Key: !Sub "${AWS::StackName}-organiser.zip"
+
+  #### Key Generator ####
+  KeyGenerator:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-key-gen"
+      Description: Lists keys under the assigned prefix
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      MemorySize: 256
+      Timeout: 120
+      Tracing: Active
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      CodeUri:
+        Bucket: !Ref CodeBucket
+        Key: !Sub "${AWS::StackName}-key-gen.zip"
+      Environment:
+        Variables:
+          IMAGE_BUCKET: !Sub
+            - s3://${Bucket}/
+            - { Bucket: !Ref CreateLandsatImageBucket }
+
+  #### Image Collector ####
+  ImageCollector:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-collector"
+      Description: Download Landsat image and uploads to S3
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      MemorySize: 10240
+      Timeout: 900
+      Tracing: Active
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:*
+              Resource: "*"
+      CodeUri:
+        Bucket: !Ref CodeBucket
+        Key: !Sub "${AWS::StackName}-collector.zip"
+      Layers:
+        - !Ref AWSCLI
+
+  #### Lambda Layers ####
+  NumpyPillow:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.6
+      Content:
+        S3Bucket: !Ref CodeBucket
+        S3Key: layers/numpy-pillow-lambda-layer.zip
+      Description: Includs the python libraries numpy and pillow
+      LayerName: numpy-pillow
+
+  AWSCLI:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.6
+      Content:
+        S3Bucket: !Ref CodeBucket
+        S3Key: layers/awscli-lambda-layer.zip
+      Description: Makes the AWS CLI available via /opt/aws
+      LayerName: aws-cli
+
+  #### State Machine ####
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Definition:
+        StartAt: LandsatOrganiser
+        States:
+          LandsatOrganiser:
+            Type: Task
+            Resource: !GetAtt [ PrefixOrganiser, Arn ]
+            Next: CollectAll
+          CollectAll:
+            Type: Map
+            InputPath: "$.detail"
+            ItemsPath: "$.prefixes"
+            MaxConcurrency: 5
+            Iterator:
+              StartAt: GenerateKeys
+              States:
+                GenerateKeys:
+                  Type: Task
+                  Resource: !GetAtt [ KeyGenerator, Arn ]
+                  Next: CollectAllImages
+                CollectAllImages:
+                  Type: Map
+                  InputPath: "$.detail"
+                  ItemsPath: "$.landsat"
+                  MaxConcurrency: 30
+                  Iterator:
+                    StartAt: LandsatCollector
+                    States:
+                      LandsatCollector:
+                        Type: Task
+                        Resource: !GetAtt [ ImageCollector, Arn ]
+                        End: true
+                  ResultPath: "$.detail.processedItems"
+                  End: true
+            ResultPath: "$.detail.collectedImages"
+            Next: SendTaskSummary
+          SendTaskSummary:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              Message:
+                Input: Landsat collection completed.
+              TopicArn: !Ref SNSTopic
+            End: true
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+      StateMachineName: !Ref AWS::StackName
+      StateMachineType: STANDARD
+      TracingConfiguration:
+        Enabled: true
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      Description: !Sub "Permissions to invoke ${AWS::StackName} functions"
+      RoleName: !Ref AWS::StackName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: "*"
+
+  #### Notification ####
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties: 
+      DisplayName: !Ref AWS::StackName
+      FifoTopic: false
+      TopicName: !Ref AWS::StackName 
