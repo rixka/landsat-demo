@@ -1,0 +1,3 @@
+[submodule "layers/aws-cli"]
+	path = layers/aws-cli
+	url = https://github.com/ilyabezdelev/aws-cli-lambda.git
